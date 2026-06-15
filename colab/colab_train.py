@@ -43,8 +43,11 @@ if is_tpu:
 elif torch.cuda.is_available():
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"[>>] GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+    # T4 (Turing) doesn't support bfloat16 — use float16. A100/H100 prefer bfloat16.
+    bf16_ok  = torch.cuda.is_bf16_supported()
+    print(f"[>>] GPU: {gpu_name} ({gpu_mem:.1f} GB) | bf16={'yes' if bf16_ok else 'no (using fp16)'}")
 else:
+    bf16_ok  = False
     print("[>>] CPU only — consider enabling GPU in runtime settings")
 
 # ── Cloud-optimised config ───────────────────────────────────
@@ -138,8 +141,11 @@ class TokenisedDataset(IterableDataset):
 
 # ── Mixed-precision scaler ───────────────────────────────────
 use_amp   = device == "cuda"
-scaler    = torch.cuda.amp.GradScaler() if use_amp else None
-amp_dtype = torch.bfloat16 if use_amp else torch.float32
+# Use bfloat16 on Ampere+ (A100, H100), float16 on Turing (T4)
+amp_dtype = (torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported())
+             else torch.float16 if use_amp
+             else torch.float32)
+scaler    = torch.amp.GradScaler("cuda") if use_amp else None
 
 # ── Training loop ────────────────────────────────────────────
 def train():
@@ -151,8 +157,8 @@ def train():
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype = torch.bfloat16,
-        device_map  = "auto" if device == "cuda" else None,
+        dtype      = amp_dtype,          # float16 on T4, bfloat16 on A100
+        device_map = "auto" if device == "cuda" else None,
     )
     if device != "cuda":
         base_model = base_model.to(device)
@@ -198,7 +204,7 @@ def train():
             input_ids = batch["input_ids"].to(device)
             labels    = batch["labels"].to(device)
 
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 outputs  = model(input_ids=input_ids, labels=labels)
                 lm_loss  = outputs.loss
                 phi_loss = model.phi_loss(weight=1e-3)
