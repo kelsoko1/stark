@@ -1,91 +1,111 @@
 # Cloud Training Guide — Q-BitNet + LingBot-World v3
 
-## Option 1: Google Colab (T4 GPU — Free)
-**Speed**: ~10–30x faster than your CPU (~3–5 sec/step vs 90 sec)
+## Continuous Training on Google Colab
 
-### Steps
-1. Go to [colab.research.google.com](https://colab.research.google.com)
-2. **Runtime → Change runtime type → T4 GPU → Save**
-3. Upload your `stark/` folder to Google Drive
-4. In a new cell, run:
+The training script now supports **continuous training** — it automatically
+saves checkpoints to Google Drive and resumes from where it left off after
+disconnects, crashes, or session timeouts.
+
+### Quick Start
+
+1. Upload your `stark/` folder to Google Drive
+2. Open `colab/colab_train.ipynb` in Google Colab
+   - Or go to [colab.research.google.com](https://colab.research.google.com)
+     → File → Upload notebook → select `colab/colab_train.ipynb`
+3. **Runtime → Change runtime type → T4 GPU → Save**
+4. Run all cells in order
+
+That's it. The notebook handles everything else:
+- Mounts Google Drive
+- Installs dependencies
+- Downloads the base model (first run only, ~5 min)
+- Checks for existing checkpoints and resumes if found
+- Saves checkpoints every 200 steps + every epoch to Drive
+- Keep-alive thread prevents idle disconnects
+- Auto-retries on CUDA OOM or runtime errors
+
+### After a Disconnect
+
+Colab free tier disconnects after ~12 hours or on inactivity.
+When this happens:
+
+1. Reconnect to the runtime (or start a new one)
+2. **Runtime → Run all** (or run cells top to bottom)
+3. The script finds your latest checkpoint on Drive and resumes automatically
+
+You can repeat this as many times as you want — training continues
+indefinitely across sessions.
+
+### Manual Setup (without the notebook)
 
 ```python
+# Cell 1
 from google.colab import drive
 drive.mount('/content/drive')
-%cd /content/drive/MyDrive/stark
 
-# Install dependencies
-!pip install -q transformers>=4.45 datasets sentencepiece huggingface_hub
+# Cell 2
+import os
+os.chdir('/content/drive/MyDrive/stark')
 
-# Run cloud training
+# Cell 3
+!pip install -q transformers>=4.45 datasets torch sentencepiece huggingface_hub accelerate
+
+# Cell 4
 !python colab/colab_train.py
 ```
 
-**Free limits**: ~12 hrs/session, sessions disconnect after inactivity.
-**Tip**: Save checkpoints to Google Drive so you don't lose progress on disconnect.
-
 ---
 
-## Option 2: Kaggle Notebooks (T4/P100 GPU — Free 30hr/week)
-**Speed**: Same as Colab T4 (~3–5 sec/step)
-**Advantage**: 30 hrs/week quota, sessions persist longer
+## How Checkpointing Works
 
-### Steps
-1. Go to [kaggle.com/code](https://kaggle.com/code) → **+ New Notebook**
-2. **Settings (right panel) → Accelerator → GPU T4×2**
-3. Upload `stark/` as a Kaggle Dataset (one-time):
-   - Kaggle → Datasets → New Dataset → Upload stark folder → Create
-4. In the notebook:
+| Feature | Details |
+|---|---|
+| Save location | `/content/drive/MyDrive/stark_checkpoints/` |
+| Save frequency | Every 200 steps + end of each epoch |
+| What's saved | Model + optimizer + brain modules + epoch + step + Phi |
+| Old checkpoints | Auto-deleted (keeps last 5) |
+| Resume | Automatic — finds latest checkpoint via `LATEST` pointer file |
 
-```python
-# Add your dataset first: + Add Data → Your Datasets → stark
-import subprocess
-subprocess.run(["pip", "install", "-q", "transformers", "datasets",
-                "sentencepiece", "huggingface_hub"])
+### Checkpoint files
 
-import os
-os.chdir("/kaggle/input/stark")
-
-exec(open("colab/colab_train.py").read())
+```
+stark_checkpoints/
+  LATEST                    # points to most recent checkpoint
+  ckpt_step_00002000.pt     # checkpoint at step 2000
+  ckpt_step_00002200.pt     # checkpoint at step 2200
+  ...
 ```
 
-**Kaggle TPU** (v3-8, 20hr/week): More complex — needs `torch_xla`. See Option 4 below.
-
 ---
 
-## Option 3: Google Colab Pro (A100 — Paid ~$10/month)
-**Speed**: ~100x faster than CPU (~1 sec/step)
+## Configuration
 
-- Same steps as Option 1 but select **A100** runtime
-- With A100 (40GB VRAM) you can unfreeze the base model:
-  - Set `FREEZE_BASE_MODEL = False` in `CloudConfig`
-  - Set `BATCH_SIZE = 8`, `MAX_SEQ_LEN = 512`
-  - Full model training — much better results
+Edit `CloudConfig` in `colab/colab_train.py` to change settings:
 
----
+| Setting | Default | Description |
+|---|---|---|
+| `MAX_EPOCHS` | 100 | High number for continuous training |
+| `CHECKPOINT_EVERY` | 200 | Save every N steps |
+| `KEEP_MAX_CHECKPOINTS` | 5 | Number of checkpoints to keep |
+| `BATCH_SIZE` | 4 | Increase on A100 (8) |
+| `MAX_SEQ_LEN` | 256 | Increase on A100 (512) |
+| `LOG_EVERY` | 10 | Print every N steps |
+| `RETRY_DELAY` | 30 | Seconds to wait before retry after crash |
+| `MAX_RETRIES` | 10 | Max consecutive retries before giving up |
 
-## Option 4: Kaggle TPU v3-8 (Free 20hr/week) — Advanced
-**Speed**: ~200x faster but requires PyTorch/XLA
+### For Colab Pro (A100)
 
-### Extra steps needed
 ```python
-!pip install -q cloud-tpu-client torch-xla==2.1 torchvision
-
-import torch_xla.core.xla_model as xm
-device = xm.xla_device()
-
-# Then run training — the colab_train.py script auto-detects TPU
-exec(open("colab/colab_train.py").read())
+FREEZE_BASE_MODEL = False   # unfreeze for full fine-tuning
+BATCH_SIZE = 8
+MAX_SEQ_LEN = 512
 ```
-
-**Note**: TPU training requires all tensors to stay on the TPU device.
-The current code has `is_tpu` detection built in.
 
 ---
 
 ## GPU Config vs CPU Config
 
-| Setting | CPU (local) | Cloud GPU | Cloud A100 |
+| Setting | CPU (local) | Colab T4 | Colab A100 |
 |---|---|---|---|
 | `BATCH_SIZE` | 1 | 4 | 8 |
 | `MAX_SEQ_LEN` | 128 | 256 | 512 |
@@ -102,22 +122,70 @@ The current code has `is_tpu` detection built in.
 |---|---|---|---|
 | Your CPU (current) | 90 | 40 | +0.06 |
 | Colab T4 | 4–5 | 720–900 | +1.1 |
-| Kaggle T4 | 4–5 | 720–900 | +1.1 |
 | Colab A100 | 0.8–1.2 | 3000–4500 | +5.5 |
-| Kaggle TPU v3-8 | 0.3–0.5 | 7200+ | +11.0 |
 
 ---
 
-## After Training on Cloud
+## Monitor Training Progress
 
-Download your checkpoints back to your PC:
+Use Cell 6 in the notebook to check checkpoint status:
+
 ```python
-# In Colab, zip and download
-import shutil
-shutil.make_archive('/content/checkpoints', 'zip', './checkpoints')
-from google.colab import files
-files.download('/content/checkpoints.zip')
+import torch
+from pathlib import Path
+
+ckpt_dir = Path('/content/drive/MyDrive/stark_checkpoints')
+ckpts = sorted(ckpt_dir.glob('ckpt_step_*.pt'))
+if ckpts:
+    state = torch.load(ckpts[-1], map_location='cpu', weights_only=False)
+    print(f"Epoch: {state['epoch']}, Step: {state['global_step']}, Phi: {state.get('phi', 0):.4f}")
 ```
 
-Then extract to `stark/checkpoints/` on your local machine
-and resume with the local trainer.
+---
+
+## Download Checkpoints to Local Machine
+
+Use Cell 7 in the notebook:
+
+```python
+import shutil
+from google.colab import files
+
+shutil.make_archive('/content/stark_checkpoints', 'zip',
+                    '/content/drive/MyDrive/stark_checkpoints')
+files.download('/content/stark_checkpoints.zip')
+```
+
+Then extract to `stark/checkpoints/` on your local machine.
+
+---
+
+## Start Fresh (Delete All Checkpoints)
+
+If you want to restart training from scratch, use Cell 8 or run:
+
+```python
+import shutil
+shutil.rmtree('/content/drive/MyDrive/stark_checkpoints', ignore_errors=True)
+```
+
+---
+
+## Kaggle (Alternative)
+
+Kaggle also works with the same script, but checkpoints won't auto-save
+to Google Drive. You'll need to save to the Kaggle output directory instead.
+
+```python
+import subprocess
+subprocess.run(["pip", "install", "-q", "transformers", "datasets",
+                "sentencepiece", "huggingface_hub", "accelerate"])
+
+import os
+os.chdir("/kaggle/input/stark")
+
+# Set checkpoint dir to Kaggle output (persists for the session)
+# Edit CloudConfig.CHECKPOINT_DIR in colab_train.py to "/kaggle/working/checkpoints"
+
+exec(open("colab/colab_train.py").read())
+```
